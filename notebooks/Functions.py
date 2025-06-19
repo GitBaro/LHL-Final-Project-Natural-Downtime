@@ -4,7 +4,210 @@ import numpy as np
 from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import StandardScaler
 import folium
+import ast
 from folium.plugins import FloatImage
+
+
+def convert_to_datetime(df, column_name):
+    """
+    Converts a specified column in the DataFrame to datetime format.
+
+    Parameters:
+        df (pd.DataFrame): The input DataFrame.
+        column_name (str): The name of the column to convert.
+
+    Returns:
+        pd.DataFrame: A copy of the DataFrame with the column converted to datetime.
+    """
+    df_copy = df.copy()
+    df_copy[column_name] = pd.to_datetime(df_copy[column_name], format='mixed')
+    return df_copy
+
+
+def extract_coords(data_str):
+    try:
+        data = ast.literal_eval(data_str.strip())
+        return pd.Series({'x': data['x'], 'y': data['y']})
+    except:
+        return pd.Series({'x': None, 'y': None})
+
+
+def sort_dataframe(df, sort_by, ascending=True, reset_idx=False):
+    """
+    Sorts a DataFrame by a given column and optionally resets the index.
+
+    Parameters:
+        df (pd.DataFrame): The DataFrame to sort.
+        sort_by (str): Column name to sort by.
+        ascending (bool): Sort order. True for ascending (default), False for descending.
+        reset_idx (bool): Whether to reset the index after sorting (default is False).
+
+    Returns:
+        pd.DataFrame: A sorted (and optionally reindexed) DataFrame.
+    """
+    df_sorted = df.sort_values(by=sort_by, ascending=ascending)
+    if reset_idx:
+        df_sorted = df_sorted.reset_index(drop=True)
+    return df_sorted
+
+
+def filter_changes(df, column_name):
+    """
+    Returns rows where the specified column changes from the previous row.
+
+    Parameters:
+        df (pd.DataFrame): The input DataFrame.
+        column_name (str): The name of the column to check for changes.
+
+    Returns:
+        pd.DataFrame: A new DataFrame with only the changed rows, index reset.
+    """
+    changed_rows = df[df[column_name] != df[column_name].shift(1)]
+    return changed_rows.reset_index(drop=True)
+
+
+def filter_trip_events(df, column_name='data', event_value=1):
+    """
+    Filters a DataFrame for rows where the specified column equals the event value.
+
+    Parameters:
+        df (pd.DataFrame): The input DataFrame.
+        column_name (str): The name of the column containing event markers (default is 'data').
+        event_value (int): The event value to filter for (e.g., 1 for start, 0 for stop).
+
+    Returns:
+        pd.DataFrame: A filtered copy of the DataFrame containing only the desired event rows.
+    """
+    return df[df[column_name] == event_value].copy()
+    
+
+def pair_trip_events(start_df, end_df, id_columns=['device_id', 'vehicle_id'],
+                     start_col='date_created', end_col='date_created'):
+    """
+    Pairs trip start and end events into a single DataFrame.
+
+    Parameters:
+        start_df (pd.DataFrame): DataFrame containing trip start events.
+        end_df (pd.DataFrame): DataFrame containing trip end events.
+        id_columns (list): List of columns identifying the trip (e.g., ['device_id', 'vehicle_id']).
+        start_col (str): Name of the column with trip start timestamps.
+        end_col (str): Name of the column with trip end timestamps.
+
+    Returns:
+        pd.DataFrame: A new DataFrame containing paired trip start and end information.
+    """
+    min_len = min(len(start_df), len(end_df))
+    paired_df = pd.DataFrame({
+        id_columns[0]: start_df[id_columns[0]].iloc[:min_len].values,
+        id_columns[1]: start_df[id_columns[1]].iloc[:min_len].values,
+        'start_time': start_df[start_col].iloc[:min_len].values,
+        'end_time': end_df[end_col].iloc[:min_len].values
+    })
+    return paired_df
+
+
+
+# For each start and end time, find closest matching timestamp in location_df
+def get_closest_location(device_id, timestamp, _location_df ):
+    subset = _location_df[_location_df['device_id'] == device_id]
+    
+    if subset.empty:
+        print(f"⚠️ No location data found for device_id {device_id}")
+        return pd.Series({'x': None, 'y': None, 'location_time': None})
+
+    subset['time_diff'] = (subset['date_created'].dt.tz_localize(None) - timestamp.tz_localize(None)).abs()
+    
+    if subset['time_diff'].isna().all():
+        print(f"⚠️ All time differences are NaT for device_id {device_id} and time {timestamp}")
+        return pd.Series({'x': None, 'y': None, 'location_time': None})
+    
+    closest = subset.loc[subset['time_diff'].idxmin()]
+    return pd.Series({'x': closest['x'], 'y': closest['y'], 'location_time': closest['date_created']})
+
+
+
+def compute_downtime_periods(trip_df,
+                              start_col='start_time',
+                              end_col='end_time',
+                              x_col='end_x',
+                              y_col='end_y',
+                              min_idle_hours=0):
+    """
+    Computes downtime periods between the end of one trip and the start of the next.
+
+    Parameters:
+        trip_df (pd.DataFrame): DataFrame with sequential trip records.
+        start_col (str): Name of the column with trip start timestamps.
+        end_col (str): Name of the column with trip end timestamps.
+        x_col (str): Name of the column with X location (used for idle location).
+        y_col (str): Name of the column with Y location (used for idle location).
+        min_idle_hours (float): Minimum downtime in hours to be included (default is 0).
+
+    Returns:
+        pd.DataFrame: DataFrame of downtime records with idle start, end, duration, and location.
+    """
+    downtime_records = []
+
+    for i in range(len(trip_df) - 1):
+        idle_start = trip_df.loc[i, end_col]
+        idle_end = trip_df.loc[i + 1, start_col]
+        idle_duration = (idle_end - idle_start).total_seconds() / 3600  # in hours
+
+        if idle_duration > min_idle_hours:
+            downtime_records.append({
+                'idle_start_time': idle_start,
+                'idle_end_time': idle_end,
+                'idle_duration_hr': idle_duration,
+                'idle_location_x': trip_df.loc[i, x_col],
+                'idle_location_y': trip_df.loc[i, y_col]
+            })
+
+    return pd.DataFrame(downtime_records)
+
+
+
+def convert_timezone(df, column_name, timezone, new_column_name=None):
+    """
+    Converts a timezone-aware datetime column to a specified timezone.
+
+    Parameters:
+        df (pd.DataFrame): The input DataFrame.
+        column_name (str): The name of the column to convert.
+        timezone (str): The target timezone (e.g., 'America/Edmonton').
+        new_column_name (str, optional): Name of the output column. If None, overwrites the original.
+
+    Returns:
+        pd.DataFrame: A copy of the DataFrame with the converted datetime column.
+    """
+    df_copy = df.copy()
+
+    if not pd.api.types.is_datetime64tz_dtype(df_copy[column_name]):
+        df_copy[column_name] = pd.to_datetime(df_copy[column_name], utc=True)
+
+    target_col = new_column_name or column_name
+    df_copy[target_col] = df_copy[column_name].dt.tz_convert(timezone)
+
+    return df_copy
+
+
+
+def compute_fractional_hour(df, hour_col, minute_col, new_column_name):
+    """
+    Computes fractional hour from a datetime column's hour and another column's minutes.
+
+    Parameters:
+        df (pd.DataFrame): Input DataFrame.
+        hour_col (str): Column name to extract the hour (usually start time).
+        minute_col (str): Column name to extract the minute (usually end time).
+        new_column_name (str): Name of the new column to store fractional hour.
+
+    Returns:
+        pd.DataFrame: A copy of the DataFrame with the new fractional hour column.
+    """
+    df_copy = df.copy()
+    df_copy[new_column_name] = df_copy[hour_col].dt.hour + df_copy[minute_col].dt.minute / 60
+    return df_copy
+
 
 
 def extract_datetime_features(df, datetime_col, timezone=None, drop_columns=False):
